@@ -464,12 +464,27 @@ lib_rotate_logs() {
 }
 
 lib_probe_proxy() {
-    # 代理自身健康端点
-    local resp
-    resp="$(curl -s --max-time 3 --unix-socket "${TARGET_SOCK}" http://localhost/_ext/healthz 2>/dev/null || true)"
+    # 判「socket 接管是否仍由本扩展代理持有」——只认 socket 属主，不依赖外网。
+    #
+    # 背景（v2.9.30 修复）：旧逻辑只 curl healthz 一次、3s 超时。而 /_ext/healthz
+    # 内部会连官方后端做一次网易云搜索探测（healthz_probe），外网断时官方后端
+    # search 超时/5xx 会让 healthz 整体变慢，curl 3s 拿不到响应就误判「接管丢失」，
+    # 看门狗于是把**健康的代理**杀掉重启（表现为「断网后反复重启/未启用」）。
+    #
+    # 现在改为：能拿到本扩展 healthz 响应（含 "upstream" 字段，无论 ok/fail）即视为
+    # 本代理持有 socket → 健康；首次连不上时再补一次官方属主探针——只有 socket 确实
+    # 被官方 trim-music 抢走（返回 INVALID TOKEN），才判定「接管丢失」需要恢复，
+    # 其余情况（代理瞬时忙 / 外网慢拖慢 healthz）都不再误杀。
+    local resp probe
+    resp="$(curl -s --max-time 8 --unix-socket "${TARGET_SOCK}" http://localhost/_ext/healthz 2>/dev/null || true)"
     case "${resp}" in
         *'"upstream"'*) return 0 ;;
-        *) return 1 ;;
+    esac
+    # 追加官方属主探针，确认 socket 究竟归谁
+    probe="$(curl -s --max-time 3 --unix-socket "${TARGET_SOCK}" "http://localhost/music/api/v1/search/track?keyword=probe" 2>/dev/null || true)"
+    case "${probe}" in
+        *'INVALID TOKEN'*|*'"code":99999'*|*'code:99999'*) return 1 ;; # 官方持有→接管丢失
+        *) return 0 ;;                                                 # 仍视为本代理持有
     esac
 }
 
